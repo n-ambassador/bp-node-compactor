@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BP Node Compactor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+    background: #1a1a2e; color: #e0e0e0; min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  .toolbar {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    background: #16213e; border-bottom: 1px solid #0f3460; flex-shrink: 0;
+  }
+  .toolbar h1 { font-size: 16px; color: #e94560; margin-right: 8px; white-space: nowrap; }
+  .toolbar button {
+    padding: 6px 16px; border-radius: 4px; border: 1px solid #0f3460;
+    background: #0f3460; color: #e0e0e0; font-size: 14px; cursor: pointer;
+    transition: background 0.2s; white-space: nowrap;
+  }
+  .toolbar button:hover { background: #e94560; }
+  .toolbar button.primary { background: #e94560; border-color: #e94560; }
+  .toolbar button.primary:hover { background: #c73650; }
+  .toolbar label {
+    display: flex; align-items: center; gap: 6px; font-size: 13px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .toolbar input[type="checkbox"] {
+    accent-color: #e94560; width: 14px; height: 14px; cursor: pointer;
+  }
+  .stats {
+    padding: 6px 20px; background: #16213e; border-bottom: 1px solid #0f3460;
+    font-size: 13px; color: #888; display: flex; gap: 24px; flex-shrink: 0;
+  }
+  .stats .highlight { color: #e94560; font-weight: bold; }
+  .main {
+    display: flex; flex: 1; min-height: 0;
+  }
+  .pane {
+    flex: 1; display: flex; flex-direction: column; min-width: 0;
+  }
+  .pane:first-child { border-right: 1px solid #0f3460; }
+  .pane-header {
+    padding: 8px 16px; background: #16213e; border-bottom: 1px solid #0f3460;
+    font-size: 13px; color: #888; flex-shrink: 0;
+  }
+  .pane textarea {
+    flex: 1; width: 100%; resize: none; border: none; outline: none;
+    background: #1a1a2e; color: #e0e0e0; font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 13px; line-height: 1.5; padding: 12px 16px;
+  }
+  .pane textarea::placeholder { color: #555; }
+  .pane textarea:focus { background: #1e1e36; }
+  .error-banner {
+    display: none; padding: 8px 20px; background: #3a1020; border-bottom: 1px solid #e94560;
+    font-size: 13px; color: #ff6b8a; flex-shrink: 0;
+  }
+  .error-banner.visible { display: block; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <h1>BP Node Compactor</h1>
+  <button class="primary" id="btnConvert">変換</button>
+  <button id="btnCopy">コピー</button>
+  <button id="btnClear">クリア</button>
+  <label><input type="checkbox" id="chkComment" checked> コメント保持</label>
+</div>
+
+<div class="stats" id="stats">
+  <span>統計: 入力テキストを貼り付けて「変換」を押してください</span>
+</div>
+
+<div class="error-banner" id="errorBanner"></div>
+
+<div class="main">
+  <div class="pane">
+    <div class="pane-header">入力（UE BP Ctrl+C テキスト）</div>
+    <textarea id="input" placeholder="UEエディタでBPノードをCtrl+Cしたテキストをここに貼り付けてください..."></textarea>
+  </div>
+  <div class="pane">
+    <div class="pane-header">出力（コンパクトJSON）</div>
+    <textarea id="output" readonly placeholder="変換結果がここに表示されます..."></textarea>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// --- Parser ---
+
+function parseBlocks(text) {
+  const blocks = [];
+  const re = /Begin Object[^\n]*\n([\s\S]*?)End Object/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    blocks.push(m[0]);
+  }
+  return blocks;
+}
+
+function extractField(block, key) {
+  // Match top-level property lines like:  Key=Value
+  const re = new RegExp('^\\s+' + key + '=(.+)$', 'm');
+  const m = block.match(re);
+  return m ? m[1].trim() : null;
+}
+
+function extractQuoted(block, key) {
+  const re = new RegExp('^\\s+' + key + '="(.*?)"', 'm');
+  const m = block.match(re);
+  return m ? m[1] : null;
+}
+
+function parseHeader(block) {
+  const m = block.match(/Begin Object\s+Class=([^\s]+)\s+Name="([^"]+)"/);
+  if (!m) return null;
+  const classPath = m[1];
+  const name = m[2];
+  // Extract node type from class path: /Script/BlueprintGraph.K2Node_CallFunction -> CallFunction
+  const dotIdx = classPath.lastIndexOf('.');
+  let type = dotIdx >= 0 ? classPath.substring(dotIdx + 1) : classPath;
+  // Remove K2Node_ prefix
+  if (type.startsWith('K2Node_')) type = type.substring(7);
+  return { name, type, classPath };
+}
+
+function parseFunctionReference(block) {
+  const m = block.match(/FunctionReference=\(([^)]*)\)/);
+  if (!m) return null;
+  const inner = m[1];
+  const result = {};
+
+  const parentMatch = inner.match(/MemberParent\s*=\s*(?:Class'|")?\/Script\/([^.'",]*)\.([^'",]*)/);
+  if (parentMatch) result.member_parent = parentMatch[2];
+
+  const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
+  if (nameMatch) result.member_name = nameMatch[1];
+
+  return (result.member_parent || result.member_name) ? result : null;
+}
+
+function parseVariableReference(block) {
+  const m = block.match(/VariableReference=\(([^)]*)\)/);
+  if (!m) return null;
+  const inner = m[1];
+  const result = {};
+
+  const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
+  if (nameMatch) result.member_name = nameMatch[1];
+
+  if (inner.includes('bSelfContext=True')) result.self = true;
+
+  const parentMatch = inner.match(/MemberParent\s*=\s*(?:Class'|")?\/Script\/([^.'",]*)\.([^'",]*)/);
+  if (parentMatch) result.member_parent = parentMatch[2];
+
+  return result.member_name ? result : null;
+}
+
+function parsePins(block) {
+  const pins = [];
+  const re = /CustomProperties Pin \(([^)]*(?:\([^)]*\)[^)]*)*)\)/g;
+  let m;
+  while ((m = re.exec(block)) !== null) {
+    const pinStr = m[1];
+    const pin = parseSinglePin(pinStr);
+    if (pin) pins.push(pin);
+  }
+  return pins;
+}
+
+function parseSinglePin(pinStr) {
+  const get = (key) => {
+    const re = new RegExp(key + '="([^"]*)"');
+    const m = pinStr.match(re);
+    return m ? m[1] : null;
+  };
+  const getUnquoted = (key) => {
+    const re = new RegExp(key + '=([^,)\\s]+)');
+    const m = pinStr.match(re);
+    return m ? m[1] : null;
+  };
+
+  const pinName = get('PinName');
+  if (!pinName) return null;
+
+  const direction = get('Direction');
+  const category = get('PinType.PinCategory');
+  const defaultValue = get('DefaultValue');
+  const defaultTextValue = get('DefaultTextValue');
+  const autoDefault = get('AutogeneratedDefaultValue');
+  const hidden = getUnquoted('bHidden');
+
+  // Parse LinkedTo
+  const linkedToMatch = pinStr.match(/LinkedTo=\(([^)]*)\)/);
+  let linkedTo = [];
+  if (linkedToMatch) {
+    const links = linkedToMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+    linkedTo = links.map(link => {
+      // Format: "K2Node_XXX PinId_YYY" — we extract node name
+      const parts = link.split(' ');
+      return { node: parts[0], pinId: parts[1] || '' };
+    });
+  }
+
+  return {
+    name: pinName,
+    direction: direction === 'EGPD_Output' ? 'out' : 'in',
+    type: category || 'exec',
+    defaultValue: defaultValue || null,
+    defaultTextValue: defaultTextValue || null,
+    autoDefault: autoDefault || null,
+    linkedTo,
+    hidden: hidden === 'True',
+  };
+}
+
+function buildPinIdToNodePin(allNodes) {
+  // Map PinId -> { nodeName, pinName }
+  // Re-parse pin IDs from raw blocks
+  const map = {};
+  for (const nodeInfo of allNodes) {
+    const re = /CustomProperties Pin \(([^)]*(?:\([^)]*\)[^)]*)*)\)/g;
+    let m;
+    while ((m = re.exec(nodeInfo.rawBlock)) !== null) {
+      const pinStr = m[1];
+      const idMatch = pinStr.match(/PinId=([^,)\s]+)/);
+      const nameMatch = pinStr.match(/PinName="([^"]*)"/);
+      if (idMatch && nameMatch) {
+        map[idMatch[1]] = { nodeName: nodeInfo.id, pinName: nameMatch[1] };
+      }
+    }
+  }
+  return map;
+}
+
+function compact(text, keepComments) {
+  const blocks = parseBlocks(text);
+  if (blocks.length === 0) {
+    throw new Error('有効な Begin Object ... End Object ブロックが見つかりませんでした。');
+  }
+
+  // First pass: parse all nodes and collect raw blocks
+  const allNodes = [];
+  for (const block of blocks) {
+    const header = parseHeader(block);
+    if (!header) continue;
+    allNodes.push({ id: header.name, type: header.type, classPath: header.classPath, rawBlock: block });
+  }
+
+  // Build PinId -> {nodeName, pinName} map
+  const pinIdMap = buildPinIdToNodePin(allNodes);
+
+  const nodes = [];
+  const execFlows = [];
+  const dataFlows = {};
+
+  for (const nodeInfo of allNodes) {
+    const block = nodeInfo.rawBlock;
+    const node = { id: nodeInfo.id, type: nodeInfo.type };
+
+    // Function reference
+    const funcRef = parseFunctionReference(block);
+    if (funcRef) {
+      if (funcRef.member_parent) node.member_parent = funcRef.member_parent;
+      if (funcRef.member_name) node.member_name = funcRef.member_name;
+    }
+
+    // Variable reference
+    const varRef = parseVariableReference(block);
+    if (varRef) {
+      if (varRef.member_name) node.member_name = varRef.member_name;
+      if (varRef.member_parent) node.member_parent = varRef.member_parent;
+      if (varRef.self) node.self = true;
+    }
+
+    // Custom function name (for custom events)
+    const customFuncName = extractQuoted(block, 'CustomFunctionName');
+    if (customFuncName) node.name = customFuncName;
+
+    // Comment
+    if (keepComments) {
+      const comment = extractQuoted(block, 'NodeComment');
+      if (comment) node.comment = comment;
+    }
+
+    // DelegateReference
+    const delegateMatch = block.match(/DelegateReference=\(([^)]*)\)/);
+    if (delegateMatch) {
+      const inner = delegateMatch[1];
+      const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
+      if (nameMatch) node.delegate_name = nameMatch[1];
+    }
+
+    // InputText (for literals like MakeStruct)
+    const inputText = extractQuoted(block, 'InputText');
+    if (inputText) node.input_text = inputText;
+
+    // Parse pins
+    const pins = parsePins(block);
+    const inputPins = [];
+    const outputPins = [];
+
+    for (const pin of pins) {
+      if (pin.hidden) continue;
+
+      const isExec = pin.type === 'exec';
+      const isOutput = pin.direction === 'out';
+
+      // Handle connections
+      if (pin.linkedTo.length > 0) {
+        for (const link of pin.linkedTo) {
+          const target = pinIdMap[link.pinId];
+          if (!target) continue;
+
+          if (isExec) {
+            if (isOutput) {
+              execFlows.push(node.id + ' -> ' + target.nodeName);
+            }
+          } else {
+            if (isOutput) {
+              const src = node.id + '.' + pin.name;
+              const dst = target.nodeName + '.' + target.pinName;
+              if (dataFlows[src]) {
+                if (Array.isArray(dataFlows[src])) {
+                  dataFlows[src].push(dst);
+                } else {
+                  dataFlows[src] = [dataFlows[src], dst];
+                }
+              } else {
+                dataFlows[src] = dst;
+              }
+            }
+          }
+        }
+      }
+
+      // Skip standard exec pins (execute, then) — they're represented in flows
+      if (isExec) continue;
+
+      // Determine effective default
+      const defVal = pin.defaultValue;
+
+      const pinObj = { name: pin.name };
+
+      // Only include type if not 'object' default
+      pinObj.type = pin.type;
+
+      // Include default value if present and not empty
+      if (defVal !== null && defVal !== '') {
+        pinObj.default_value = defVal;
+      }
+
+      // Mark connected pins
+      if (pin.linkedTo.length > 0) {
+        pinObj.connected = true;
+      }
+
+      if (isOutput) {
+        outputPins.push(pinObj);
+      } else {
+        inputPins.push(pinObj);
+      }
+    }
+
+    // Only add pin arrays if non-empty
+    if (inputPins.length > 0) node.input_pins = inputPins;
+    if (outputPins.length > 0) node.output_pins = outputPins;
+
+    nodes.push(node);
+  }
+
+  const result = { nodes };
+
+  // Add flows if non-empty
+  const flows = {};
+  if (execFlows.length > 0) flows.execution = execFlows;
+  if (Object.keys(dataFlows).length > 0) flows.data = dataFlows;
+  if (Object.keys(flows).length > 0) result.flows = flows;
+
+  return result;
+}
+
+// --- UI ---
+
+const inputEl = document.getElementById('input');
+const outputEl = document.getElementById('output');
+const statsEl = document.getElementById('stats');
+const errorEl = document.getElementById('errorBanner');
+const btnConvert = document.getElementById('btnConvert');
+const btnCopy = document.getElementById('btnCopy');
+const btnClear = document.getElementById('btnClear');
+const chkComment = document.getElementById('chkComment');
+
+function showError(msg) {
+  errorEl.textContent = msg;
+  errorEl.classList.add('visible');
+}
+
+function hideError() {
+  errorEl.classList.remove('visible');
+}
+
+function doConvert() {
+  hideError();
+  const raw = inputEl.value.trim();
+  if (!raw) {
+    outputEl.value = '';
+    statsEl.innerHTML = '<span>統計: 入力テキストを貼り付けて「変換」を押してください</span>';
+    return;
+  }
+
+  try {
+    const result = compact(raw, chkComment.checked);
+    const json = JSON.stringify(result, null, 2);
+    outputEl.value = json;
+
+    const origLen = raw.length;
+    const compLen = json.length;
+    const reduction = ((1 - compLen / origLen) * 100).toFixed(1);
+    statsEl.innerHTML =
+      '<span>元テキスト: <span class="highlight">' + origLen.toLocaleString() + '</span> 文字</span>' +
+      '<span>コンパクト後: <span class="highlight">' + compLen.toLocaleString() + '</span> 文字</span>' +
+      '<span>削減率: <span class="highlight">' + reduction + '%</span></span>' +
+      '<span>ノード数: <span class="highlight">' + result.nodes.length + '</span></span>';
+  } catch (e) {
+    showError('パースエラー: ' + e.message);
+    outputEl.value = '';
+  }
+}
+
+btnConvert.addEventListener('click', doConvert);
+
+btnCopy.addEventListener('click', () => {
+  const text = outputEl.value;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btnCopy.textContent;
+    btnCopy.textContent = 'コピー済み!';
+    setTimeout(() => { btnCopy.textContent = orig; }, 1500);
+  });
+});
+
+btnClear.addEventListener('click', () => {
+  inputEl.value = '';
+  outputEl.value = '';
+  hideError();
+  statsEl.innerHTML = '<span>統計: 入力テキストを貼り付けて「変換」を押してください</span>';
+});
+
+// Auto-convert on paste
+inputEl.addEventListener('paste', () => {
+  setTimeout(doConvert, 50);
+});
+</script>
+</body>
+</html>
