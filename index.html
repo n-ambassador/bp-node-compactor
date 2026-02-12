@@ -95,10 +95,23 @@
 
 function parseBlocks(text) {
   const blocks = [];
-  const re = /Begin Object[^\n]*\n([\s\S]*?)End Object/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    blocks.push(m[0]);
+  const lines = text.split('\n');
+  let current = [];
+  let depth = 0;
+  for (const line of lines) {
+    const opens = (line.match(/\bBegin Object\b/g) || []).length;
+    const closes = (line.match(/\bEnd Object\b/g) || []).length;
+    if (depth === 0 && opens > 0) {
+      current = [];
+    }
+    if (depth > 0 || opens > 0) {
+      current.push(line);
+    }
+    depth += opens - closes;
+    if (depth === 0 && current.length > 0) {
+      blocks.push(current.join('\n'));
+      current = [];
+    }
   }
   return blocks;
 }
@@ -111,9 +124,9 @@ function extractField(block, key) {
 }
 
 function extractQuoted(block, key) {
-  const re = new RegExp('^\\s+' + key + '="(.*?)"', 'm');
+  const re = new RegExp('^\\s+' + key + '="((?:[^"\\\\]|\\\\.)*)"', 'm');
   const m = block.match(re);
-  return m ? m[1] : null;
+  return m ? m[1].replace(/\\"/g, '"') : null;
 }
 
 function parseHeader(block) {
@@ -175,12 +188,12 @@ function parsePins(block) {
 
 function parseSinglePin(pinStr) {
   const get = (key) => {
-    const re = new RegExp(key + '="([^"]*)"');
+    const re = new RegExp('\\b' + key + '="((?:[^"\\\\]|\\\\.)*)"');
     const m = pinStr.match(re);
-    return m ? m[1] : null;
+    return m ? m[1].replace(/\\"/g, '"') : null;
   };
   const getUnquoted = (key) => {
-    const re = new RegExp(key + '=([^,)\\s]+)');
+    const re = new RegExp('\\b' + key + '=([^,)\\s]+)');
     const m = pinStr.match(re);
     return m ? m[1] : null;
   };
