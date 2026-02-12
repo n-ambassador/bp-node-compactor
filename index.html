@@ -135,7 +135,7 @@ function parseFunctionReference(block) {
   const inner = m[1];
   const result = {};
 
-  const parentMatch = inner.match(/MemberParent\s*=\s*(?:Class'|")?\/Script\/([^.'",]*)\.([^'",]*)/);
+  const parentMatch = inner.match(/MemberParent\s*=\s*[^,)]*\/Script\/([^.'",]*)\.([^'",]*)/);
   if (parentMatch) result.member_parent = parentMatch[2];
 
   const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
@@ -155,7 +155,7 @@ function parseVariableReference(block) {
 
   if (inner.includes('bSelfContext=True')) result.self = true;
 
-  const parentMatch = inner.match(/MemberParent\s*=\s*(?:Class'|")?\/Script\/([^.'",]*)\.([^'",]*)/);
+  const parentMatch = inner.match(/MemberParent\s*=\s*[^,)]*\/Script\/([^.'",]*)\.([^'",]*)/);
   if (parentMatch) result.member_parent = parentMatch[2];
 
   return result.member_name ? result : null;
@@ -163,7 +163,7 @@ function parseVariableReference(block) {
 
 function parsePins(block) {
   const pins = [];
-  const re = /CustomProperties Pin \(([^)]*(?:\([^)]*\)[^)]*)*)\)/g;
+  const re = /CustomProperties Pin \(([^()]*(?:\([^)]*\)[^()]*)*)\)/g;
   let m;
   while ((m = re.exec(block)) !== null) {
     const pinStr = m[1];
@@ -224,7 +224,7 @@ function buildPinIdToNodePin(allNodes) {
   // Re-parse pin IDs from raw blocks
   const map = {};
   for (const nodeInfo of allNodes) {
-    const re = /CustomProperties Pin \(([^)]*(?:\([^)]*\)[^)]*)*)\)/g;
+    const re = /CustomProperties Pin \(([^()]*(?:\([^)]*\)[^()]*)*)\)/g;
     let m;
     while ((m = re.exec(nodeInfo.rawBlock)) !== null) {
       const pinStr = m[1];
