@@ -128,21 +128,56 @@ function extractInt(block, key) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+// UE meta-class names that mean "type unresolved" — when UE writes these as
+// the *concrete* type, it actually means it didn't serialize the real type.
+// We treat them as null so the type falls back to PinCategory.
+const GENERIC_META = new Set([
+  'ScriptStruct', 'Class', 'Object', 'Enum', 'Interface',
+  'BlueprintGeneratedClass', 'AnimBlueprintGeneratedClass', 'WidgetBlueprintGeneratedClass',
+  'UserDefinedStruct', 'UserDefinedEnum', 'Function', 'Property',
+]);
+
 // Extract leaf name from /Path/To.AssetName-style refs.
-// Handles: "/Script/X.Y", Class'"/Script/X.Y"', BlueprintGeneratedClass'"/Game/.../X_C.X_C"', None, ""
+// UE serialization layers these many ways — prefer the innermost concrete path:
+//   "/Script/Engine.BlueprintGeneratedClass'/Game/.../FLib_X.FLib_X_C'"  → FLib_X
+//   Class'"/Script/Engine.KismetSystemLibrary"'                           → KismetSystemLibrary
+//   /Script/Engine.KismetSystemLibrary                                    → KismetSystemLibrary
+// Returns null for UE generic meta-class refs (so callers can fall back).
 function extractRefName(raw) {
   if (!raw) return null;
   raw = raw.trim();
   if (raw === 'None' || raw === '""' || raw === '') return null;
-  const inner = raw.match(/['"]([^'"]+)['"]/);
-  const path = inner ? inner[1] : raw;
+
+  // Prefer the LAST single-quoted segment — UE wraps concrete asset paths in
+  // single quotes after the metaclass name (e.g. Class'/Path/Asset' or
+  // outer-double-quoted "Class'/Path/Asset'").
+  let path = null;
+  const sqAll = [...raw.matchAll(/'([^']+)'/g)];
+  if (sqAll.length > 0) {
+    path = sqAll[sqAll.length - 1][1];
+  } else {
+    const dq = raw.match(/"([^"]+)"/);
+    path = dq ? dq[1] : raw;
+  }
+  // Strip stray surrounding quotes from the inner path.
+  path = path.replace(/^["']+|["']+$/g, '');
+
   const lastDot = path.lastIndexOf('.');
   const lastSlash = path.lastIndexOf('/');
   const start = Math.max(lastDot, lastSlash);
   let name = path.substring(start + 1);
-  // Strip trailing _C from BP-generated class names so 'BPI_Foo_C' → 'BPI_Foo'
   if (name.endsWith('_C')) name = name.substring(0, name.length - 2);
-  return name || null;
+  if (!name) return null;
+  if (GENERIC_META.has(name)) return null;
+  return name;
+}
+
+// Pull the most informative leaf name out of a BoundGraph / MacroGraph reference,
+// skipping the wrapping class name like "EdGraph".
+function extractGraphName(raw, ignoreClass) {
+  if (!raw) return null;
+  const parts = raw.split(/[\/.':"\s]+/).filter(s => s && s !== ignoreClass);
+  return parts.length > 0 ? parts[parts.length - 1] : null;
 }
 
 function parseHeader(block) {
@@ -296,6 +331,23 @@ function parseSinglePin(pinStr) {
 // Compactor: structured nodes → compact LLM-oriented JSON
 // =====================================================================
 
+// When FunctionReference's MemberParent is generic (e.g. Class'/Script/CoreUObject.Class'),
+// fall back to the library implied by the K2Node subclass.
+const NODE_DEFAULT_PARENT = {
+  CallArrayFunction: 'KismetArrayLibrary',
+  CallMaterialParameterCollectionFunction: 'KismetMaterialLibrary',
+};
+
+// Last-resort: infer the library from the function name pattern.
+function inferLibFromMemberName(name) {
+  if (!name) return null;
+  if (name.startsWith('Array_')) return 'KismetArrayLibrary';
+  if (name.startsWith('Set_')) return 'BlueprintSetLibrary';
+  if (name.startsWith('Map_')) return 'BlueprintMapLibrary';
+  if (/^(Delay|DelayUntilNextTick|PrintString|MakeLiteral|GetGameTimeInSeconds|IsValid|GetClass|K2_)/.test(name)) return 'KismetSystemLibrary';
+  return null;
+}
+
 const KIND_MAP = {
   CallFunction: 'Call',
   CallArrayFunction: 'Call',
@@ -397,18 +449,49 @@ function compact(text, opts) {
   }
 
   // Knot bypass: walk through chains of Knot nodes transparently.
-  function followKnot(node, pin, isExec) {
-    let cur = { node, pin };
-    let safety = 50;
-    while (cur.node.type === 'Knot' && safety-- > 0) {
+  // Returns an array of resolved {node, pin} destinations (Knots can branch).
+  function followKnots(node, pin, isExec) {
+    const out = [];
+    const stack = [{ node, pin }];
+    const visited = new Set();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      const key = cur.node.id + ':' + cur.pin.pinId;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      if (cur.node.type !== 'Knot') {
+        out.push(cur);
+        continue;
+      }
       const nextPin = cur.node.pins.find(pp => pp.direction === 'out' && (isExec ? pp.pinType.isExec : !pp.pinType.isExec));
-      if (!nextPin || nextPin.linkedTo.length === 0) return null;
-      const link = nextPin.linkedTo[0];
-      const target = pinMap[link.pinId];
-      if (!target) return null;
-      cur = target;
+      if (!nextPin) continue;
+      for (const link of nextPin.linkedTo) {
+        const target = pinMap[link.pinId];
+        if (!target) continue;
+        stack.push(target);
+      }
     }
-    return cur;
+    return out;
+  }
+
+  // Walk backwards through Knots on a self/Target input pin to find the source VariableGet.
+  function traceVarGetThroughKnots(linkedTo) {
+    const stack = [...linkedTo];
+    const visited = new Set();
+    while (stack.length > 0) {
+      const link = stack.pop();
+      if (visited.has(link.pinId)) continue;
+      visited.add(link.pinId);
+      const tgt = pinMap[link.pinId];
+      if (!tgt) continue;
+      if (tgt.node.type === 'Knot') {
+        const inPin = tgt.node.pins.find(p => p.direction === 'in' && !p.pinType.isExec);
+        if (inPin) stack.push(...inPin.linkedTo);
+        continue;
+      }
+      if (tgt.node.type === 'VariableGet') return tgt.node;
+    }
+    return null;
   }
 
   const outNodes = {};
@@ -444,13 +527,35 @@ function compact(text, opts) {
       case 'CallDelegate': {
         const fn = parseRefBlock(n.block, 'FunctionReference');
         if (fn) {
-          let parent = fn.member_parent;
-          // Resolve generic BlueprintGeneratedClass via self pin's actual subObject (interfaces etc.)
+          let parent = fn.member_parent; // already null if generic meta-class
+
+          // 1) Self-context call → owning BP itself
+          if (!parent && fn.self) parent = 'self';
+
           const selfPin = n.pins.find(p => (p.name === 'self' || p.name === 'Target') && p.direction === 'in');
-          if ((parent === 'BlueprintGeneratedClass' || !parent) && selfPin && selfPin.pinType.subObject) {
+
+          // 2) Concrete class name on self pin (interfaces, components etc.)
+          if (!parent && selfPin && selfPin.pinType.subObject) {
             parent = selfPin.pinType.subObject;
           }
-          if (!parent) parent = fn.self ? 'self' : '?';
+
+          // 3) Trace self pin's incoming connection back to a VariableGet — use the var name
+          //    as a human-readable parent (e.g. 'Outfit Control Comp').
+          if (!parent && selfPin && selfPin.linkedTo.length > 0) {
+            const varNode = traceVarGetThroughKnots(selfPin.linkedTo);
+            if (varNode) {
+              const vref = parseRefBlock(varNode.block, 'VariableReference');
+              if (vref && vref.member_name) parent = vref.member_name;
+            }
+          }
+
+          // 4) K2Node-subclass implies a known library
+          if (!parent) parent = NODE_DEFAULT_PARENT[n.type] || null;
+
+          // 5) Function-name pattern fallback (Array_*, Delay, etc.)
+          if (!parent) parent = inferLibFromMemberName(fn.member_name);
+
+          if (!parent) parent = '?';
           out.fn = parent + '::' + (fn.member_name || '?');
         }
         if (/bIsPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
@@ -497,12 +602,18 @@ function compact(text, opts) {
           const tagMatch = chPin.defaultValue.match(/TagName="([^"]+)"/);
           if (tagMatch) out.ch = tagMatch[1];
         }
-        // Resolve payload type via what its consumer expects (the connected break/struct pin).
-        const payloadPin = n.pins.find(p => p.name === 'Payload' && p.direction === 'out');
-        if (payloadPin && payloadPin.linkedTo.length > 0) {
-          const tgt = pinMap[payloadPin.linkedTo[0].pinId];
-          if (tgt && tgt.pin.pinType.subObject) {
-            out.payload = tgt.pin.pinType.subObject;
+        // Prefer PayloadType input pin's class default — that's the user-set struct type.
+        const ptPin = n.pins.find(p => p.name === 'PayloadType');
+        if (ptPin && ptPin.defaultObject) {
+          const ref = extractRefName(ptPin.defaultObject);
+          if (ref) out.payload = ref;
+        }
+        // Fallback: trace consumer Break pin's struct type
+        if (!out.payload) {
+          const payloadPin = n.pins.find(p => p.name === 'Payload' && p.direction === 'out');
+          if (payloadPin && payloadPin.linkedTo.length > 0) {
+            const tgt = pinMap[payloadPin.linkedTo[0].pinId];
+            if (tgt && tgt.pin.pinType.subObject) out.payload = tgt.pin.pinType.subObject;
           }
         }
         break;
@@ -535,27 +646,18 @@ function compact(text, opts) {
         const mIdx = n.block.indexOf('MacroGraphReference=(');
         if (mIdx >= 0) {
           const inner = readParenBlock(n.block, mIdx + 'MacroGraphReference=('.length);
-          const graphMatch = inner.match(/MacroGraph=[^"']*['"]([^"']+)['"]/);
+          const graphMatch = inner.match(/MacroGraph=([^,)]+)/);
           if (graphMatch) {
-            const path = graphMatch[1];
-            const colon = path.lastIndexOf(':');
-            const dot = path.lastIndexOf('.');
-            const slash = path.lastIndexOf('/');
-            const cut = Math.max(colon, dot, slash);
-            const name = cut >= 0 ? path.substring(cut + 1) : path;
+            const name = extractGraphName(graphMatch[1].trim(), 'EdGraph');
             if (name) out.ref = name;
           }
         }
         break;
       }
       case 'Composite': {
-        const bgMatch = n.block.match(/BoundGraph=[^"']*['"]([^"']+)['"]/);
+        const bgMatch = n.block.match(/BoundGraph=([^\r\n]+)/);
         if (bgMatch) {
-          const path = bgMatch[1];
-          const colon = path.lastIndexOf(':');
-          const dot = path.lastIndexOf('.');
-          const cut = Math.max(colon, dot);
-          const name = cut >= 0 ? path.substring(cut + 1) : path;
+          const name = extractGraphName(bgMatch[1].trim(), 'EdGraph');
           if (name) out.name = name;
         }
         break;
@@ -580,10 +682,20 @@ function compact(text, opts) {
       }
     }
 
-    // Default-value inputs (unconnected only — connected ones live in `data` flows)
+    // Default-value inputs (unconnected only — connected ones live in `data` flows).
+    // Skip pins whose information is already surfaced elsewhere on the node.
     const ins = {};
     for (const p of n.pins) {
       if (p.direction !== 'in' || p.pinType.isExec || p.hidden || p.linkedTo.length > 0) continue;
+
+      // Per-node-type duplicate suppression
+      if (n.type === 'VariableSet' && out.var && p.name === out.var) continue;
+      if (n.type === 'AsyncAction_ListenForGameplayMessages') {
+        if (p.name === 'Channel') continue;       // already in `ch`
+        if (p.name === 'PayloadType') continue;   // already in `payload`
+        if (p.name === 'MatchType' && /ExactMatch/i.test(p.defaultValue || '')) continue;
+      }
+
       const objRef = p.defaultObject ? extractRefName(p.defaultObject) : null;
       const v = simplifyDefault(p.defaultValue);
       let value = objRef !== null ? objRef : v;
@@ -618,24 +730,25 @@ function compact(text, opts) {
         const target = pinMap[link.pinId];
         if (!target) continue;
 
-        const resolved = followKnot(target.node, target.pin, p.pinType.isExec);
-        if (!resolved) continue;
-        if (resolved.node.type === 'VariableGet' || resolved.node.type === 'EdGraphNode_Comment') continue;
-        if (resolved.node.id === n.id) continue; // self-loop guard (composite leaks)
+        const resolvedList = followKnots(target.node, target.pin, p.pinType.isExec);
+        for (const resolved of resolvedList) {
+          if (resolved.node.type === 'VariableGet' || resolved.node.type === 'EdGraphNode_Comment') continue;
+          if (resolved.node.id === n.id) continue; // self-loop guard (composite leaks)
 
-        if (p.pinType.isExec) {
-          const lbl = execLabel(n.type, p.name);
-          const src = lbl ? n.id + ':' + lbl : n.id;
-          execEdges.push([src, resolved.node.id]);
-        } else {
-          let src;
-          if (varGetterPins[p.pinId]) {
-            src = 'vars:' + varGetterPins[p.pinId];
+          if (p.pinType.isExec) {
+            const lbl = execLabel(n.type, p.name);
+            const src = lbl ? n.id + ':' + lbl : n.id;
+            execEdges.push([src, resolved.node.id]);
           } else {
-            src = n.id + ':' + p.name;
+            let src;
+            if (varGetterPins[p.pinId]) {
+              src = 'vars:' + varGetterPins[p.pinId];
+            } else {
+              src = n.id + ':' + p.name;
+            }
+            const dst = resolved.node.id + ':' + resolved.pin.name;
+            dataEdges.push([src, dst]);
           }
-          const dst = resolved.node.id + ':' + resolved.pin.name;
-          dataEdges.push([src, dst]);
         }
       }
     }
