@@ -14,6 +14,7 @@
   .toolbar {
     display: flex; align-items: center; gap: 12px; padding: 12px 20px;
     background: #16213e; border-bottom: 1px solid #0f3460; flex-shrink: 0;
+    flex-wrap: wrap;
   }
   .toolbar h1 { font-size: 16px; color: #e94560; margin-right: 8px; white-space: nowrap; }
   .toolbar button {
@@ -34,6 +35,7 @@
   .stats {
     padding: 6px 20px; background: #16213e; border-bottom: 1px solid #0f3460;
     font-size: 13px; color: #888; display: flex; gap: 24px; flex-shrink: 0;
+    flex-wrap: wrap;
   }
   .stats .highlight { color: #e94560; font-weight: bold; }
   .main {
@@ -83,7 +85,7 @@
     <textarea id="input" placeholder="UEエディタでBPノードをCtrl+Cしたテキストをここに貼り付けてください..."></textarea>
   </div>
   <div class="pane">
-    <div class="pane-header">出力（コンパクトJSON）</div>
+    <div class="pane-header">出力（コンパクトJSON / LLM向け意味情報）</div>
     <textarea id="output" readonly placeholder="変換結果がここに表示されます..."></textarea>
   </div>
 </div>
@@ -91,7 +93,9 @@
 <script>
 'use strict';
 
-// --- Parser ---
+// =====================================================================
+// Parser: UE BP Ctrl+C text → structured node objects
+// =====================================================================
 
 function parseBlocks(text) {
   const blocks = [];
@@ -101,12 +105,8 @@ function parseBlocks(text) {
   for (const line of lines) {
     const opens = (line.match(/\bBegin Object\b/g) || []).length;
     const closes = (line.match(/\bEnd Object\b/g) || []).length;
-    if (depth === 0 && opens > 0) {
-      current = [];
-    }
-    if (depth > 0 || opens > 0) {
-      current.push(line);
-    }
+    if (depth === 0 && opens > 0) current = [];
+    if (depth > 0 || opens > 0) current.push(line);
     depth += opens - closes;
     if (depth === 0 && current.length > 0) {
       blocks.push(current.join('\n'));
@@ -116,17 +116,33 @@ function parseBlocks(text) {
   return blocks;
 }
 
-function extractField(block, key) {
-  // Match top-level property lines like:  Key=Value
-  const re = new RegExp('^\\s+' + key + '=(.+)$', 'm');
-  const m = block.match(re);
-  return m ? m[1].trim() : null;
-}
-
 function extractQuoted(block, key) {
   const re = new RegExp('^\\s+' + key + '="((?:[^"\\\\]|\\\\.)*)"', 'm');
   const m = block.match(re);
   return m ? m[1].replace(/\\"/g, '"') : null;
+}
+
+function extractInt(block, key) {
+  const re = new RegExp('^\\s+' + key + '=(-?\\d+)', 'm');
+  const m = block.match(re);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Extract leaf name from /Path/To.AssetName-style refs.
+// Handles: "/Script/X.Y", Class'"/Script/X.Y"', BlueprintGeneratedClass'"/Game/.../X_C.X_C"', None, ""
+function extractRefName(raw) {
+  if (!raw) return null;
+  raw = raw.trim();
+  if (raw === 'None' || raw === '""' || raw === '') return null;
+  const inner = raw.match(/['"]([^'"]+)['"]/);
+  const path = inner ? inner[1] : raw;
+  const lastDot = path.lastIndexOf('.');
+  const lastSlash = path.lastIndexOf('/');
+  const start = Math.max(lastDot, lastSlash);
+  let name = path.substring(start + 1);
+  // Strip trailing _C from BP-generated class names so 'BPI_Foo_C' → 'BPI_Foo'
+  if (name.endsWith('_C')) name = name.substring(0, name.length - 2);
+  return name || null;
 }
 
 function parseHeader(block) {
@@ -134,52 +150,99 @@ function parseHeader(block) {
   if (!m) return null;
   const classPath = m[1];
   const name = m[2];
-  // Extract node type from class path: /Script/BlueprintGraph.K2Node_CallFunction -> CallFunction
   const dotIdx = classPath.lastIndexOf('.');
   let type = dotIdx >= 0 ? classPath.substring(dotIdx + 1) : classPath;
-  // Remove K2Node_ prefix
   if (type.startsWith('K2Node_')) type = type.substring(7);
   return { name, type, classPath };
 }
 
-function parseFunctionReference(block) {
-  const m = block.match(/FunctionReference=\(([^)]*)\)/);
-  if (!m) return null;
-  const inner = m[1];
-  const result = {};
-
-  const parentMatch = inner.match(/MemberParent\s*=\s*[^,)]*\/Script\/([^.'",]*)\.([^'",]*)/);
-  if (parentMatch) result.member_parent = parentMatch[2];
-
-  const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
-  if (nameMatch) result.member_name = nameMatch[1];
-
-  return (result.member_parent || result.member_name) ? result : null;
+// Read a balanced (...) block starting at startIdx (which points just after the opening '(').
+function readParenBlock(text, startIdx) {
+  let depth = 1;
+  let i = startIdx;
+  while (i < text.length && depth > 0) {
+    const c = text[i];
+    if (c === '"') {
+      i++;
+      while (i < text.length && text[i] !== '"') {
+        if (text[i] === '\\') i++;
+        i++;
+      }
+    } else if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) break;
+    }
+    i++;
+  }
+  return text.substring(startIdx, i);
 }
 
-function parseVariableReference(block) {
-  const m = block.match(/VariableReference=\(([^)]*)\)/);
-  if (!m) return null;
-  const inner = m[1];
+function parseRefBlock(block, key) {
+  const marker = key + '=(';
+  const idx = block.indexOf(marker);
+  if (idx === -1) return null;
+  const inner = readParenBlock(block, idx + marker.length);
   const result = {};
 
+  const parentMatch = inner.match(/MemberParent\s*=\s*([^,]+(?:'[^']*')?)/);
+  if (parentMatch) {
+    const refName = extractRefName(parentMatch[1].trim());
+    if (refName) result.member_parent = refName;
+  }
   const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
   if (nameMatch) result.member_name = nameMatch[1];
+  if (/bSelfContext\s*=\s*True/.test(inner)) result.self = true;
 
-  if (inner.includes('bSelfContext=True')) result.self = true;
+  return Object.keys(result).length > 0 ? result : null;
+}
 
-  const parentMatch = inner.match(/MemberParent\s*=\s*[^,)]*\/Script\/([^.'",]*)\.([^'",]*)/);
-  if (parentMatch) result.member_parent = parentMatch[2];
+// Parse PinType.* fields from a single pin's content string.
+function parsePinType(pinStr) {
+  const cat = (pinStr.match(/PinType\.PinCategory="([^"]*)"/) || [])[1] || '';
+  const subCat = (pinStr.match(/PinType\.PinSubCategory="([^"]*)"/) || [])[1] || '';
+  const subObjMatch = pinStr.match(/PinType\.PinSubCategoryObject=([^,)]+(?:'[^']*')?)/);
+  const subObj = subObjMatch ? extractRefName(subObjMatch[1]) : null;
+  const container = (pinStr.match(/PinType\.ContainerType=(\w+)/) || [])[1] || 'None';
 
-  return result.member_name ? result : null;
+  let valueType = null;
+  if (container === 'Map') {
+    const valIdx = pinStr.indexOf('PinType.PinValueType=(');
+    if (valIdx >= 0) {
+      const valStr = readParenBlock(pinStr, valIdx + 'PinType.PinValueType=('.length);
+      const valSubMatch = valStr.match(/TerminalSubCategoryObject=([^,)]+(?:'[^']*')?)/);
+      if (valSubMatch) valueType = extractRefName(valSubMatch[1]);
+      if (!valueType) {
+        const valCat = (valStr.match(/TerminalCategory="?([^,)\s"]+)/) || [])[1];
+        if (valCat) valueType = valCat;
+      }
+    }
+  }
+
+  const isExec = cat === 'exec';
+  const isDelegate = cat === 'delegate' || cat === 'mcdelegate';
+
+  let typeName;
+  if (isExec) typeName = 'exec';
+  else if (cat === 'wildcard') typeName = 'wildcard';
+  else if (subObj) typeName = subObj;
+  else if (cat) typeName = cat;
+  else typeName = 'unknown';
+
+  if (container === 'Array') typeName += '[]';
+  else if (container === 'Set') typeName = 'Set<' + typeName + '>';
+  else if (container === 'Map') typeName = 'Map<' + typeName + ', ' + (valueType || '?') + '>';
+
+  return { category: cat, subCategory: subCat, subObject: subObj, container, valueType, type: typeName, isExec, isDelegate };
 }
 
 function parsePins(block) {
   const pins = [];
-  const re = /CustomProperties Pin \(([^()]*(?:\([^)]*\)[^()]*)*)\)/g;
+  const re = /CustomProperties Pin \(/g;
   let m;
   while ((m = re.exec(block)) !== null) {
-    const pinStr = m[1];
+    const start = m.index + m[0].length;
+    const pinStr = readParenBlock(block, start);
     const pin = parseSinglePin(pinStr);
     if (pin) pins.push(pin);
   }
@@ -189,216 +252,450 @@ function parsePins(block) {
 function parseSinglePin(pinStr) {
   const get = (key) => {
     const re = new RegExp('\\b' + key + '="((?:[^"\\\\]|\\\\.)*)"');
-    const m = pinStr.match(re);
-    return m ? m[1].replace(/\\"/g, '"') : null;
+    const mm = pinStr.match(re);
+    return mm ? mm[1].replace(/\\"/g, '"') : null;
   };
-  const getUnquoted = (key) => {
+  const getUnq = (key) => {
     const re = new RegExp('\\b' + key + '=([^,)\\s]+)');
-    const m = pinStr.match(re);
-    return m ? m[1] : null;
+    const mm = pinStr.match(re);
+    return mm ? mm[1] : null;
   };
 
+  const pinId = getUnq('PinId');
   const pinName = get('PinName');
-  if (!pinName) return null;
+  if (!pinId || !pinName) return null;
 
   const direction = get('Direction');
-  const category = get('PinType.PinCategory');
   const defaultValue = get('DefaultValue');
-  const defaultTextValue = get('DefaultTextValue');
-  const autoDefault = get('AutogeneratedDefaultValue');
-  const hidden = getUnquoted('bHidden');
+  const defaultObject = getUnq('DefaultObject');
+  const hidden = getUnq('bHidden') === 'True';
 
-  // Parse LinkedTo
   const linkedToMatch = pinStr.match(/LinkedTo=\(([^)]*)\)/);
   let linkedTo = [];
   if (linkedToMatch) {
     const links = linkedToMatch[1].split(',').map(s => s.trim()).filter(Boolean);
     linkedTo = links.map(link => {
-      // Format: "K2Node_XXX PinId_YYY" — we extract node name
-      const parts = link.split(' ');
+      const parts = link.split(/\s+/);
       return { node: parts[0], pinId: parts[1] || '' };
     });
   }
 
   return {
+    pinId,
     name: pinName,
     direction: direction === 'EGPD_Output' ? 'out' : 'in',
-    type: category || 'exec',
-    defaultValue: defaultValue || null,
-    defaultTextValue: defaultTextValue || null,
-    autoDefault: autoDefault || null,
+    pinType: parsePinType(pinStr),
+    defaultValue,
+    defaultObject: defaultObject && defaultObject !== 'None' && defaultObject !== '""' ? defaultObject : null,
     linkedTo,
-    hidden: hidden === 'True',
+    hidden,
   };
 }
 
-function buildPinIdToNodePin(allNodes) {
-  // Map PinId -> { nodeName, pinName }
-  // Re-parse pin IDs from raw blocks
-  const map = {};
-  for (const nodeInfo of allNodes) {
-    const re = /CustomProperties Pin \(([^()]*(?:\([^)]*\)[^()]*)*)\)/g;
-    let m;
-    while ((m = re.exec(nodeInfo.rawBlock)) !== null) {
-      const pinStr = m[1];
-      const idMatch = pinStr.match(/PinId=([^,)\s]+)/);
-      const nameMatch = pinStr.match(/PinName="([^"]*)"/);
-      if (idMatch && nameMatch) {
-        map[idMatch[1]] = { nodeName: nodeInfo.id, pinName: nameMatch[1] };
-      }
-    }
-  }
-  return map;
+// =====================================================================
+// Compactor: structured nodes → compact LLM-oriented JSON
+// =====================================================================
+
+const KIND_MAP = {
+  CallFunction: 'Call',
+  CallArrayFunction: 'Call',
+  CallMaterialParameterCollectionFunction: 'Call',
+  CallDelegate: 'Call',
+  VariableSet: 'VarSet',
+  IfThenElse: 'If',
+  ExecutionSequence: 'Seq',
+  SwitchEnum: 'Switch',
+  SwitchInteger: 'Switch',
+  SwitchString: 'Switch',
+  SwitchName: 'Switch',
+  EnumEquality: 'EnumEq',
+  EnumLiteral: 'EnumLit',
+  BreakStruct: 'Break',
+  MakeStruct: 'Make',
+  Literal: 'Lit',
+  Self: 'Self',
+  Cast: 'Cast',
+  DynamicCast: 'Cast',
+  ClassDynamicCast: 'Cast',
+  MacroInstance: 'Macro',
+  Composite: 'Subgraph',
+  Tunnel: 'Tunnel',
+  Event: 'Event',
+  CustomEvent: 'CustomEvent',
+  AsyncAction_ListenForGameplayMessages: 'Listen',
+  Timeline: 'Timeline',
+  AddComponent: 'AddComp',
+  SpawnActorFromClass: 'Spawn',
+};
+
+function simplifyDefault(val) {
+  if (val === null || val === undefined) return null;
+  // GameplayTag (TagName="X")
+  const tagMatch = typeof val === 'string' ? val.match(/^\(TagName="([^"]*)"\)$/) : null;
+  if (tagMatch) return tagMatch[1] === '' ? null : tagMatch[1];
+  // GameplayTagContainer (GameplayTags=((TagName="X"),...))
+  // Just return raw — too complex to simplify safely
+  return val;
 }
 
-function compact(text, keepComments) {
+function execLabel(nodeType, pinName) {
+  if (nodeType === 'IfThenElse') {
+    if (pinName === 'then') return 'T';
+    if (pinName === 'else') return 'F';
+  }
+  if (nodeType === 'ExecutionSequence') {
+    const m = pinName.match(/^then_(\d+)$/);
+    if (m) return m[1];
+  }
+  if (nodeType === 'SwitchEnum' || nodeType === 'SwitchInteger' ||
+      nodeType === 'SwitchString' || nodeType === 'SwitchName') {
+    if (pinName !== 'execute' && pinName !== 'Default' && pinName !== 'then') return pinName;
+  }
+  if (nodeType === 'AsyncAction_ListenForGameplayMessages') {
+    if (pinName === 'OnMessageReceived') return 'msg';
+  }
+  if (nodeType === 'MacroInstance') {
+    if (/^(LoopBody|For Each|ForEach|Body)$/i.test(pinName)) return 'body';
+    if (/^(Completed|Done|Finished)$/i.test(pinName)) return 'done';
+    if (pinName === 'IsValid') return 'valid';
+    if (pinName === 'IsNotValid') return 'invalid';
+  }
+  if (nodeType === 'DynamicCast' || nodeType === 'Cast' || nodeType === 'ClassDynamicCast') {
+    if (pinName === 'CastSucceeded' || pinName === 'then') return 'ok';
+    if (pinName === 'CastFailed') return 'fail';
+  }
+  return null;
+}
+
+function compact(text, opts) {
   const blocks = parseBlocks(text);
   if (blocks.length === 0) {
     throw new Error('有効な Begin Object ... End Object ブロックが見つかりませんでした。');
   }
 
-  // First pass: parse all nodes and collect raw blocks
+  // Pass 1: parse all node skeletons
   const allNodes = [];
   for (const block of blocks) {
     const header = parseHeader(block);
     if (!header) continue;
-    allNodes.push({ id: header.name, type: header.type, classPath: header.classPath, rawBlock: block });
+    allNodes.push({
+      id: header.name,
+      type: header.type,
+      classPath: header.classPath,
+      block,
+      pins: parsePins(block),
+      pos: { x: extractInt(block, 'NodePosX'), y: extractInt(block, 'NodePosY') },
+      size: { w: extractInt(block, 'NodeWidth'), h: extractInt(block, 'NodeHeight') },
+      comment: extractQuoted(block, 'NodeComment'),
+    });
   }
 
-  // Build PinId -> {nodeName, pinName} map
-  const pinIdMap = buildPinIdToNodePin(allNodes);
+  // PinId → {node, pin}
+  const pinMap = {};
+  for (const n of allNodes) {
+    for (const p of n.pins) pinMap[p.pinId] = { node: n, pin: p };
+  }
 
-  const nodes = [];
-  const execFlows = [];
-  const dataFlows = {};
+  // Knot bypass: walk through chains of Knot nodes transparently.
+  function followKnot(node, pin, isExec) {
+    let cur = { node, pin };
+    let safety = 50;
+    while (cur.node.type === 'Knot' && safety-- > 0) {
+      const nextPin = cur.node.pins.find(pp => pp.direction === 'out' && (isExec ? pp.pinType.isExec : !pp.pinType.isExec));
+      if (!nextPin || nextPin.linkedTo.length === 0) return null;
+      const link = nextPin.linkedTo[0];
+      const target = pinMap[link.pinId];
+      if (!target) return null;
+      cur = target;
+    }
+    return cur;
+  }
 
-  for (const nodeInfo of allNodes) {
-    const block = nodeInfo.rawBlock;
-    const node = { id: nodeInfo.id, type: nodeInfo.type };
+  const outNodes = {};
+  const execEdges = [];
+  const dataEdges = [];
+  const variables = {};       // name → typeName
+  const varGetterPins = {};   // pinId → variable name
 
-    // Function reference
-    const funcRef = parseFunctionReference(block);
-    if (funcRef) {
-      if (funcRef.member_parent) node.member_parent = funcRef.member_parent;
-      if (funcRef.member_name) node.member_name = funcRef.member_name;
+  // Pass 2: classify each node and collect VariableGet pins.
+  for (const n of allNodes) {
+    if (n.type === 'Knot') continue;
+
+    if (n.type === 'VariableGet') {
+      const ref = parseRefBlock(n.block, 'VariableReference');
+      if (ref && ref.member_name) {
+        const outPin = n.pins.find(p => p.direction === 'out' && !p.pinType.isExec && !p.hidden);
+        if (outPin) {
+          if (!variables[ref.member_name]) variables[ref.member_name] = outPin.pinType.type;
+          varGetterPins[outPin.pinId] = ref.member_name;
+        }
+      }
+      continue;
     }
 
-    // Variable reference
-    const varRef = parseVariableReference(block);
-    if (varRef) {
-      if (varRef.member_name) node.member_name = varRef.member_name;
-      if (varRef.member_parent) node.member_parent = varRef.member_parent;
-      if (varRef.self) node.self = true;
-    }
+    if (n.type === 'EdGraphNode_Comment') continue; // handled later as groups
 
-    // Custom function name (for custom events)
-    const customFuncName = extractQuoted(block, 'CustomFunctionName');
-    if (customFuncName) node.name = customFuncName;
+    const out = { k: KIND_MAP[n.type] || n.type };
 
-    // Comment
-    if (keepComments) {
-      const comment = extractQuoted(block, 'NodeComment');
-      if (comment) node.comment = comment;
-    }
-
-    // DelegateReference
-    const delegateMatch = block.match(/DelegateReference=\(([^)]*)\)/);
-    if (delegateMatch) {
-      const inner = delegateMatch[1];
-      const nameMatch = inner.match(/MemberName\s*=\s*"([^"]*)"/);
-      if (nameMatch) node.delegate_name = nameMatch[1];
-    }
-
-    // InputText (for literals like MakeStruct)
-    const inputText = extractQuoted(block, 'InputText');
-    if (inputText) node.input_text = inputText;
-
-    // Parse pins
-    const pins = parsePins(block);
-    const inputPins = [];
-    const outputPins = [];
-
-    for (const pin of pins) {
-      if (pin.hidden) continue;
-
-      const isExec = pin.type === 'exec';
-      const isOutput = pin.direction === 'out';
-
-      // Handle connections
-      if (pin.linkedTo.length > 0) {
-        for (const link of pin.linkedTo) {
-          const target = pinIdMap[link.pinId];
-          if (!target) continue;
-
-          if (isExec) {
-            if (isOutput) {
-              execFlows.push(node.id + ' -> ' + target.nodeName);
-            }
-          } else {
-            if (isOutput) {
-              const src = node.id + '.' + pin.name;
-              const dst = target.nodeName + '.' + target.pinName;
-              if (dataFlows[src]) {
-                if (Array.isArray(dataFlows[src])) {
-                  dataFlows[src].push(dst);
-                } else {
-                  dataFlows[src] = [dataFlows[src], dst];
-                }
-              } else {
-                dataFlows[src] = dst;
-              }
+    switch (n.type) {
+      case 'CallFunction':
+      case 'CallArrayFunction':
+      case 'CallMaterialParameterCollectionFunction':
+      case 'CallDelegate': {
+        const fn = parseRefBlock(n.block, 'FunctionReference');
+        if (fn) {
+          let parent = fn.member_parent;
+          // Resolve generic BlueprintGeneratedClass via self pin's actual subObject (interfaces etc.)
+          const selfPin = n.pins.find(p => (p.name === 'self' || p.name === 'Target') && p.direction === 'in');
+          if ((parent === 'BlueprintGeneratedClass' || !parent) && selfPin && selfPin.pinType.subObject) {
+            parent = selfPin.pinType.subObject;
+          }
+          if (!parent) parent = fn.self ? 'self' : '?';
+          out.fn = parent + '::' + (fn.member_name || '?');
+        }
+        if (/bIsPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
+        break;
+      }
+      case 'VariableSet': {
+        const ref = parseRefBlock(n.block, 'VariableReference');
+        if (ref && ref.member_name) {
+          out.var = ref.member_name;
+          const inPin = n.pins.find(p => p.direction === 'in' && p.name === ref.member_name);
+          if (inPin) {
+            if (!variables[ref.member_name]) variables[ref.member_name] = inPin.pinType.type;
+            if (inPin.linkedTo.length === 0) {
+              const d = simplifyDefault(inPin.defaultValue);
+              if (d !== null) out.to = d;
             }
           }
         }
+        break;
       }
-
-      // Skip standard exec pins (execute, then) — they're represented in flows
-      if (isExec) continue;
-
-      // Determine effective default
-      const defVal = pin.defaultValue;
-
-      const pinObj = { name: pin.name };
-
-      // Only include type if not 'object' default
-      pinObj.type = pin.type;
-
-      // Include default value if present and not empty
-      if (defVal !== null && defVal !== '') {
-        pinObj.default_value = defVal;
+      case 'Event': {
+        const ref = parseRefBlock(n.block, 'EventReference');
+        if (ref && ref.member_name) out.name = ref.member_name;
+        else {
+          const ovr = parseRefBlock(n.block, 'OverrideFunction');
+          if (ovr && ovr.member_name) out.name = ovr.member_name;
+        }
+        break;
       }
-
-      // Mark connected pins
-      if (pin.linkedTo.length > 0) {
-        pinObj.connected = true;
+      case 'CustomEvent': {
+        const cName = extractQuoted(n.block, 'CustomFunctionName');
+        if (cName) out.name = cName;
+        const args = n.pins.filter(p =>
+          p.direction === 'out' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden);
+        if (args.length > 0) {
+          out.args = {};
+          for (const a of args) out.args[a.name] = a.pinType.type;
+        }
+        break;
       }
-
-      if (isOutput) {
-        outputPins.push(pinObj);
-      } else {
-        inputPins.push(pinObj);
+      case 'AsyncAction_ListenForGameplayMessages': {
+        const chPin = n.pins.find(p => p.name === 'Channel');
+        if (chPin && chPin.defaultValue) {
+          const tagMatch = chPin.defaultValue.match(/TagName="([^"]+)"/);
+          if (tagMatch) out.ch = tagMatch[1];
+        }
+        // Resolve payload type via what its consumer expects (the connected break/struct pin).
+        const payloadPin = n.pins.find(p => p.name === 'Payload' && p.direction === 'out');
+        if (payloadPin && payloadPin.linkedTo.length > 0) {
+          const tgt = pinMap[payloadPin.linkedTo[0].pinId];
+          if (tgt && tgt.pin.pinType.subObject) {
+            out.payload = tgt.pin.pinType.subObject;
+          }
+        }
+        break;
+      }
+      case 'BreakStruct':
+      case 'MakeStruct': {
+        const sMatch = n.block.match(/StructType=([^\r\n,]+)/);
+        if (sMatch) {
+          const s = extractRefName(sMatch[1].trim());
+          if (s) out.struct = s;
+        }
+        break;
+      }
+      case 'SwitchEnum': {
+        // Try multiple enum field forms
+        let eMatch = n.block.match(/Enum=([^\r\n,]+)/);
+        if (!eMatch) eMatch = n.block.match(/EnumType=([^\r\n,]+)/);
+        if (eMatch) {
+          const e = extractRefName(eMatch[1].trim());
+          if (e) out.enum = e;
+        }
+        break;
+      }
+      case 'EnumEquality': {
+        const aPin = n.pins.find(p => p.name === 'A' && p.direction === 'in');
+        if (aPin && aPin.pinType.subObject) out.enum = aPin.pinType.subObject;
+        break;
+      }
+      case 'MacroInstance': {
+        const mIdx = n.block.indexOf('MacroGraphReference=(');
+        if (mIdx >= 0) {
+          const inner = readParenBlock(n.block, mIdx + 'MacroGraphReference=('.length);
+          const graphMatch = inner.match(/MacroGraph=[^"']*['"]([^"']+)['"]/);
+          if (graphMatch) {
+            const path = graphMatch[1];
+            const colon = path.lastIndexOf(':');
+            const dot = path.lastIndexOf('.');
+            const slash = path.lastIndexOf('/');
+            const cut = Math.max(colon, dot, slash);
+            const name = cut >= 0 ? path.substring(cut + 1) : path;
+            if (name) out.ref = name;
+          }
+        }
+        break;
+      }
+      case 'Composite': {
+        const bgMatch = n.block.match(/BoundGraph=[^"']*['"]([^"']+)['"]/);
+        if (bgMatch) {
+          const path = bgMatch[1];
+          const colon = path.lastIndexOf(':');
+          const dot = path.lastIndexOf('.');
+          const cut = Math.max(colon, dot);
+          const name = cut >= 0 ? path.substring(cut + 1) : path;
+          if (name) out.name = name;
+        }
+        break;
+      }
+      case 'DynamicCast':
+      case 'ClassDynamicCast': {
+        const tgtMatch = n.block.match(/TargetType=([^\r\n,]+)/);
+        if (tgtMatch) {
+          const t = extractRefName(tgtMatch[1].trim());
+          if (t) out.to = t;
+        }
+        break;
+      }
+      case 'SpawnActorFromClass': {
+        // ActorClass pin holds default
+        const ac = n.pins.find(p => p.name === 'Class' || p.name === 'ActorClass');
+        if (ac && ac.defaultObject) {
+          const r = extractRefName(ac.defaultObject);
+          if (r) out.cls = r;
+        }
+        break;
       }
     }
 
-    // Only add pin arrays if non-empty
-    if (inputPins.length > 0) node.input_pins = inputPins;
-    if (outputPins.length > 0) node.output_pins = outputPins;
+    // Default-value inputs (unconnected only — connected ones live in `data` flows)
+    const ins = {};
+    for (const p of n.pins) {
+      if (p.direction !== 'in' || p.pinType.isExec || p.hidden || p.linkedTo.length > 0) continue;
+      const objRef = p.defaultObject ? extractRefName(p.defaultObject) : null;
+      const v = simplifyDefault(p.defaultValue);
+      let value = objRef !== null ? objRef : v;
+      if (value === null || value === '' || value === 'None') continue;
+      // For enum byte values, prefix with type so the LLM sees 'EShelfType.Common' not bare 'Common'
+      if (p.pinType.category === 'byte' && p.pinType.subObject && typeof value === 'string' &&
+          !/^\d/.test(value) && value !== 'False' && value !== 'True') {
+        value = p.pinType.subObject + '.' + value;
+      }
+      ins[p.name] = value;
+    }
+    if (Object.keys(ins).length > 0) out.in = ins;
 
-    nodes.push(node);
+    // Per-node author comment (if any) — distinct from comment-box groups
+    if (opts.keepComments && n.comment) {
+      out.note = n.comment;
+    }
+
+    outNodes[n.id] = out;
   }
 
-  const result = { nodes };
+  // Pass 3: emit flows
+  // VariableGet is included so its outgoing data edges become `vars:Name -> X:Y`,
+  // but its outgoing exec edges (none typically) are skipped via isExec check.
+  for (const n of allNodes) {
+    if (n.type === 'Knot' || n.type === 'EdGraphNode_Comment') continue;
 
-  // Add flows if non-empty
-  const flows = {};
-  if (execFlows.length > 0) flows.execution = execFlows;
-  if (Object.keys(dataFlows).length > 0) flows.data = dataFlows;
-  if (Object.keys(flows).length > 0) result.flows = flows;
+    for (const p of n.pins) {
+      if (p.direction !== 'out' || p.linkedTo.length === 0 || p.hidden) continue;
+
+      for (const link of p.linkedTo) {
+        const target = pinMap[link.pinId];
+        if (!target) continue;
+
+        const resolved = followKnot(target.node, target.pin, p.pinType.isExec);
+        if (!resolved) continue;
+        if (resolved.node.type === 'VariableGet' || resolved.node.type === 'EdGraphNode_Comment') continue;
+        if (resolved.node.id === n.id) continue; // self-loop guard (composite leaks)
+
+        if (p.pinType.isExec) {
+          const lbl = execLabel(n.type, p.name);
+          const src = lbl ? n.id + ':' + lbl : n.id;
+          execEdges.push([src, resolved.node.id]);
+        } else {
+          let src;
+          if (varGetterPins[p.pinId]) {
+            src = 'vars:' + varGetterPins[p.pinId];
+          } else {
+            src = n.id + ':' + p.name;
+          }
+          const dst = resolved.node.id + ':' + resolved.pin.name;
+          dataEdges.push([src, dst]);
+        }
+      }
+    }
+  }
+
+  // Dedup edges (Composites can produce duplicates from internal pin leaks).
+  const dedupEdges = (arr) => {
+    const seen = new Set();
+    const out = [];
+    for (const [a, b] of arr) {
+      const key = a + ' ' + b;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push([a, b]);
+    }
+    return out;
+  };
+
+  // Pass 4: comment-box groups (use position bounds to compute containment).
+  const groups = [];
+  if (opts.keepComments) {
+    const comments = allNodes.filter(n => n.type === 'EdGraphNode_Comment' && n.pos.x !== null);
+    const others = allNodes.filter(n =>
+      n.type !== 'EdGraphNode_Comment' && n.type !== 'Knot' && n.type !== 'VariableGet' && n.pos.x !== null);
+
+    for (const c of comments) {
+      const cx = c.pos.x, cy = c.pos.y;
+      const cw = c.size.w || 400;
+      const ch = c.size.h || 200;
+      const contained = [];
+      for (const o of others) {
+        if (o.pos.x >= cx && o.pos.x <= cx + cw &&
+            o.pos.y >= cy && o.pos.y <= cy + ch) {
+          contained.push(o.id);
+        }
+      }
+      if (contained.length > 0 && c.comment) {
+        groups.push({ label: c.comment, nodes: contained });
+      } else if (c.comment) {
+        // Standalone comment with no contained nodes — keep as a node so info isn't lost.
+        outNodes[c.id] = { k: 'Comment', text: c.comment };
+      }
+    }
+  }
+
+  const result = {};
+  if (Object.keys(variables).length > 0) result.vars = variables;
+  if (groups.length > 0) result.groups = groups;
+  result.nodes = outNodes;
+  const eExec = dedupEdges(execEdges);
+  const eData = dedupEdges(dataEdges);
+  if (eExec.length > 0) result.exec = eExec;
+  if (eData.length > 0) result.data = eData;
 
   return result;
 }
 
-// --- UI ---
+// =====================================================================
+// UI
+// =====================================================================
 
 const inputEl = document.getElementById('input');
 const outputEl = document.getElementById('output');
@@ -413,10 +710,7 @@ function showError(msg) {
   errorEl.textContent = msg;
   errorEl.classList.add('visible');
 }
-
-function hideError() {
-  errorEl.classList.remove('visible');
-}
+function hideError() { errorEl.classList.remove('visible'); }
 
 function doConvert() {
   hideError();
@@ -426,20 +720,22 @@ function doConvert() {
     statsEl.innerHTML = '<span>統計: 入力テキストを貼り付けて「変換」を押してください</span>';
     return;
   }
-
   try {
-    const result = compact(raw, chkComment.checked);
+    const result = compact(raw, { keepComments: chkComment.checked });
     const json = JSON.stringify(result, null, 2);
     outputEl.value = json;
 
     const origLen = raw.length;
     const compLen = json.length;
     const reduction = ((1 - compLen / origLen) * 100).toFixed(1);
+    const nodeCount = Object.keys(result.nodes || {}).length;
     statsEl.innerHTML =
       '<span>元テキスト: <span class="highlight">' + origLen.toLocaleString() + '</span> 文字</span>' +
       '<span>コンパクト後: <span class="highlight">' + compLen.toLocaleString() + '</span> 文字</span>' +
       '<span>削減率: <span class="highlight">' + reduction + '%</span></span>' +
-      '<span>ノード数: <span class="highlight">' + result.nodes.length + '</span></span>';
+      '<span>ノード数: <span class="highlight">' + nodeCount + '</span></span>' +
+      '<span>変数: <span class="highlight">' + Object.keys(result.vars || {}).length + '</span></span>' +
+      '<span>グループ: <span class="highlight">' + (result.groups || []).length + '</span></span>';
   } catch (e) {
     showError('パースエラー: ' + e.message);
     outputEl.value = '';
@@ -447,7 +743,6 @@ function doConvert() {
 }
 
 btnConvert.addEventListener('click', doConvert);
-
 btnCopy.addEventListener('click', () => {
   const text = outputEl.value;
   if (!text) return;
@@ -457,18 +752,13 @@ btnCopy.addEventListener('click', () => {
     setTimeout(() => { btnCopy.textContent = orig; }, 1500);
   });
 });
-
 btnClear.addEventListener('click', () => {
   inputEl.value = '';
   outputEl.value = '';
   hideError();
   statsEl.innerHTML = '<span>統計: 入力テキストを貼り付けて「変換」を押してください</span>';
 });
-
-// Auto-convert on paste
-inputEl.addEventListener('paste', () => {
-  setTimeout(doConvert, 50);
-});
+inputEl.addEventListener('paste', () => { setTimeout(doConvert, 50); });
 </script>
 </body>
 </html>
