@@ -353,6 +353,7 @@ const KIND_MAP = {
   CallArrayFunction: 'Call',
   CallMaterialParameterCollectionFunction: 'Call',
   CallDelegate: 'Call',
+  PromotableOperator: 'Op',
   VariableSet: 'VarSet',
   IfThenElse: 'If',
   ExecutionSequence: 'Seq',
@@ -538,7 +539,8 @@ function compact(text, opts) {
       case 'CallFunction':
       case 'CallArrayFunction':
       case 'CallMaterialParameterCollectionFunction':
-      case 'CallDelegate': {
+      case 'CallDelegate':
+      case 'PromotableOperator': {
         const fn = parseRefBlock(n.block, 'FunctionReference');
         if (fn) {
           let parent = fn.member_parent; // already null if generic meta-class
@@ -572,7 +574,8 @@ function compact(text, opts) {
           if (!parent) parent = '?';
           out.fn = parent + '::' + (fn.member_name || '?');
         }
-        if (/bIsPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
+        // bIsPureFunc on K2Node_CallFunction, bDefaultsToPureFunc on K2Node_PromotableOperator.
+        if (/bIsPureFunc\s*=\s*True|bDefaultsToPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
         const fnRets = collectOutputTypes(n.pins);
         if (fnRets) out.ret = fnRets;
         break;
@@ -599,6 +602,10 @@ function compact(text, opts) {
           const ovr = parseRefBlock(n.block, 'OverrideFunction');
           if (ovr && ovr.member_name) out.name = ovr.member_name;
         }
+        // Event params are output pins (delegates filtered out by collectOutputTypes).
+        // Mirrors CustomEvent so interface/override events surface their param types.
+        const args = collectOutputTypes(n.pins);
+        if (args) out.args = args;
         break;
       }
       case 'CustomEvent': {
@@ -702,6 +709,24 @@ function compact(text, opts) {
         }
         const compRets = collectOutputTypes(n.pins);
         if (compRets) out.ret = compRets;
+        break;
+      }
+      case 'Tunnel': {
+        // Composite/MacroInstance entry/exit tunnel.
+        // bCanHaveOutputs=True → entry: outputs are the subgraph's input params (args).
+        // bCanHaveInputs=True  → exit: inputs are the subgraph's return values (ret).
+        if (/bCanHaveOutputs\s*=\s*True/.test(n.block)) {
+          const args = collectOutputTypes(n.pins);
+          if (args) out.args = args;
+        }
+        if (/bCanHaveInputs\s*=\s*True/.test(n.block)) {
+          const rets = n.pins.filter(p =>
+            p.direction === 'in' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden);
+          if (rets.length > 0) {
+            out.ret = {};
+            for (const r of rets) out.ret[r.name] = r.pinType.type;
+          }
+        }
         break;
       }
       case 'DynamicCast':
