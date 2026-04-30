@@ -395,6 +395,19 @@ function collectOutputTypes(pins) {
   return obj;
 }
 
+// Collect non-exec input pins as { pinName: typeName }. Returns null if empty.
+// Skips the self/Target pin (its type is already reflected in `fn`'s parent).
+// Mirrors `ret` so a CallFunction-style node carries a full signature.
+function collectInputTypes(pins) {
+  const params = pins.filter(p =>
+    p.direction === 'in' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden &&
+    p.name !== 'self' && p.name !== 'Target');
+  if (params.length === 0) return null;
+  const obj = {};
+  for (const p of params) obj[p.name] = p.pinType.type;
+  return obj;
+}
+
 function simplifyDefault(val) {
   if (val === null || val === undefined) return null;
   // GameplayTag (TagName="X")
@@ -576,6 +589,8 @@ function compact(text, opts) {
         }
         // bIsPureFunc on K2Node_CallFunction, bDefaultsToPureFunc on K2Node_PromotableOperator.
         if (/bIsPureFunc\s*=\s*True|bDefaultsToPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
+        const fnParams = collectInputTypes(n.pins);
+        if (fnParams) out.params = fnParams;
         const fnRets = collectOutputTypes(n.pins);
         if (fnRets) out.ret = fnRets;
         break;
@@ -697,6 +712,8 @@ function compact(text, opts) {
             if (name) out.ref = name;
           }
         }
+        const macroParams = collectInputTypes(n.pins);
+        if (macroParams) out.params = macroParams;
         const macroRets = collectOutputTypes(n.pins);
         if (macroRets) out.ret = macroRets;
         break;
@@ -707,6 +724,8 @@ function compact(text, opts) {
           const name = extractGraphName(bgMatch[1].trim(), 'EdGraph');
           if (name) out.name = name;
         }
+        const compParams = collectInputTypes(n.pins);
+        if (compParams) out.params = compParams;
         const compRets = collectOutputTypes(n.pins);
         if (compRets) out.ret = compRets;
         break;
