@@ -380,6 +380,18 @@ const KIND_MAP = {
   SpawnActorFromClass: 'Spawn',
 };
 
+// Collect non-exec output pins as { pinName: typeName }. Returns null if empty.
+// Used to surface "what does this node hand back" — function returns, BreakStruct
+// fields, MacroInstance/Composite tunnel outputs, etc.
+function collectOutputTypes(pins) {
+  const rets = pins.filter(p =>
+    p.direction === 'out' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden);
+  if (rets.length === 0) return null;
+  const obj = {};
+  for (const r of rets) obj[r.name] = r.pinType.type;
+  return obj;
+}
+
 function simplifyDefault(val) {
   if (val === null || val === undefined) return null;
   // GameplayTag (TagName="X")
@@ -559,6 +571,8 @@ function compact(text, opts) {
           out.fn = parent + '::' + (fn.member_name || '?');
         }
         if (/bIsPureFunc\s*=\s*True/.test(n.block)) out.pure = true;
+        const fnRets = collectOutputTypes(n.pins);
+        if (fnRets) out.ret = fnRets;
         break;
       }
       case 'VariableSet': {
@@ -625,6 +639,12 @@ function compact(text, opts) {
           const s = extractRefName(sMatch[1].trim());
           if (s) out.struct = s;
         }
+        // BreakStruct outputs are the struct's individual fields — surface them.
+        // MakeStruct's lone output is the struct itself, already named via `struct`.
+        if (n.type === 'BreakStruct') {
+          const breakRets = collectOutputTypes(n.pins);
+          if (breakRets) out.ret = breakRets;
+        }
         break;
       }
       case 'SwitchEnum': {
@@ -652,6 +672,8 @@ function compact(text, opts) {
             if (name) out.ref = name;
           }
         }
+        const macroRets = collectOutputTypes(n.pins);
+        if (macroRets) out.ret = macroRets;
         break;
       }
       case 'Composite': {
@@ -660,6 +682,8 @@ function compact(text, opts) {
           const name = extractGraphName(bgMatch[1].trim(), 'EdGraph');
           if (name) out.name = name;
         }
+        const compRets = collectOutputTypes(n.pins);
+        if (compRets) out.ret = compRets;
         break;
       }
       case 'DynamicCast':
