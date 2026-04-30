@@ -374,6 +374,8 @@ const KIND_MAP = {
   Tunnel: 'Tunnel',
   Event: 'Event',
   CustomEvent: 'CustomEvent',
+  FunctionEntry: 'Entry',
+  FunctionResult: 'Return',
   AsyncAction_ListenForGameplayMessages: 'Listen',
   Timeline: 'Timeline',
   AddComponent: 'AddComp',
@@ -602,11 +604,27 @@ function compact(text, opts) {
       case 'CustomEvent': {
         const cName = extractQuoted(n.block, 'CustomFunctionName');
         if (cName) out.name = cName;
-        const args = n.pins.filter(p =>
-          p.direction === 'out' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden);
-        if (args.length > 0) {
-          out.args = {};
-          for (const a of args) out.args[a.name] = a.pinType.type;
+        const args = collectOutputTypes(n.pins);
+        if (args) out.args = args;
+        break;
+      }
+      case 'FunctionEntry': {
+        // Function entry node — output pins are the function's parameters.
+        const ref = parseRefBlock(n.block, 'FunctionReference');
+        if (ref && ref.member_name) out.name = ref.member_name;
+        const args = collectOutputTypes(n.pins);
+        if (args) out.args = args;
+        break;
+      }
+      case 'FunctionResult': {
+        // Function return node — input pins are the values being returned.
+        const ref = parseRefBlock(n.block, 'FunctionReference');
+        if (ref && ref.member_name) out.name = ref.member_name;
+        const rets = n.pins.filter(p =>
+          p.direction === 'in' && !p.pinType.isExec && !p.pinType.isDelegate && !p.hidden);
+        if (rets.length > 0) {
+          out.ret = {};
+          for (const r of rets) out.ret[r.name] = r.pinType.type;
         }
         break;
       }
