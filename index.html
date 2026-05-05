@@ -97,23 +97,96 @@
 // Parser: UE BP Ctrl+C text → structured node objects
 // =====================================================================
 
-function parseBlocks(text) {
-  const blocks = [];
+// Parse text into a tree of { header, ownLines, children } nodes.
+//   header   = the literal `Begin Object ...` line for this block
+//   ownLines = content lines that belong DIRECTLY to this block, EXCLUDING
+//              anything inside nested Begin Object ... End Object pairs
+//   children = recursively parsed sub-blocks
+// This separation matters for Composite/MacroInstance: their visible (outer)
+// pins live at the outer level, while their subgraph is a nested EdGraph
+// child whose pins must NOT bleed into the parent's pin list.
+function parseBlockTree(text) {
   const lines = text.split('\n');
-  let current = [];
-  let depth = 0;
+  const root = { children: [] };
+  const stack = [root];
   for (const line of lines) {
     const opens = (line.match(/\bBegin Object\b/g) || []).length;
     const closes = (line.match(/\bEnd Object\b/g) || []).length;
-    if (depth === 0 && opens > 0) current = [];
-    if (depth > 0 || opens > 0) current.push(line);
-    depth += opens - closes;
-    if (depth === 0 && current.length > 0) {
-      blocks.push(current.join('\n'));
-      current = [];
+    if (opens > closes) {
+      const node = { header: line, ownLines: [], children: [] };
+      stack[stack.length - 1].children.push(node);
+      stack.push(node);
+    } else if (closes > opens) {
+      if (stack.length > 1) stack.pop();
+    } else if (opens === 0 && closes === 0) {
+      const cur = stack[stack.length - 1];
+      if (cur !== root) cur.ownLines.push(line);
     }
   }
-  return blocks;
+  return root.children;
+}
+
+// Flatten one tree node back to a string containing only its header + own
+// (non-nested) lines + a closing End Object. Lets the regex-based
+// parseHeader / parsePins / extractInt run cleanly without seeing inner
+// nodes' content (which previously contaminated Composite pin lists).
+function renderOuter(node) {
+  return node.header + '\n' + node.ownLines.join('\n') + '\nEnd Object';
+}
+
+// Render a tree node and all its descendants verbatim. Used when emitting
+// a synthesized inner block that itself may contain further nested blocks
+// (e.g. a Composite nested inside another Composite).
+function renderFull(node) {
+  const inner = node.children.map(renderFull).join('\n');
+  return node.header + '\n' + node.ownLines.join('\n') +
+    (inner ? '\n' + inner : '') + '\nEnd Object';
+}
+
+// Pull the inner graph of a K2Node_Composite block out as a synthesized
+// top-level block-string list that compact() can recursively process.
+//
+// UE serializes a Composite's subgraph in two phases as direct children:
+//   phase 1: `Begin Object Class=/Script/Engine.EdGraph Name="..."` whose
+//            children are empty `Begin Object Class=K2Node_X Name="Y"` stubs
+//            (type declarations only)
+//   phase 2: `Begin Object Name="..."` (no Class=) whose children are
+//            `Begin Object Name="Y"` (no Class=) carrying the full
+//            properties / pins / nested children
+//
+// We merge by name: take each phase-2 grandchild, look up its Class from
+// any descendant Begin Object that does carry a Class=, and emit
+// `Begin Object Class=<C> Name="<N>" ...own lines... [nested children]
+// End Object`. Output is plain T3D text — feed it back into parseBlockTree.
+function extractSubgraphText(compositeTree) {
+  const classMap = {};
+  (function walk(n) {
+    const m = n.header && n.header.match(/Begin Object\s+Class=([^\s]+)\s+Name="([^"]+)"/);
+    if (m) classMap[m[2]] = m[1];
+    for (const c of n.children || []) walk(c);
+  })(compositeTree);
+
+  const out = [];
+  for (const child of compositeTree.children) {
+    const hm = child.header.match(/Begin Object(?:\s+Class=([^\s]+))?\s+Name="([^"]+)"/);
+    if (!hm) continue;
+    if (hm[1]) continue;                       // skip declaration-phase EdGraph
+    if (child.children.length === 0) continue;
+    for (const grand of child.children) {
+      const gm = grand.header.match(/Begin Object(?:\s+Class=([^\s]+))?\s+Name="([^"]+)"/);
+      if (!gm) continue;
+      const gname = gm[2];
+      const gcls = gm[1] || classMap[gname];
+      if (!gcls) continue;
+      const exportPart = (grand.header.match(/(ExportPath="[^"]*")/) || [, ''])[1];
+      const synthHeader = 'Begin Object Class=' + gcls + ' Name="' + gname + '"' +
+        (exportPart ? ' ' + exportPart : '');
+      const innerStr = grand.children.map(renderFull).join('\n');
+      out.push(synthHeader + '\n' + grand.ownLines.join('\n') +
+        (innerStr ? '\n' + innerStr : '') + '\nEnd Object');
+    }
+  }
+  return out.length > 0 ? out.join('\n') : null;
 }
 
 function extractQuoted(block, key) {
@@ -447,15 +520,20 @@ function execLabel(nodeType, pinName) {
   return null;
 }
 
-function compact(text, opts) {
-  const blocks = parseBlocks(text);
-  if (blocks.length === 0) {
-    throw new Error('有効な Begin Object ... End Object ブロックが見つかりませんでした。');
+function compact(text, opts, _depth) {
+  if (_depth === undefined) _depth = 0;
+  const trees = parseBlockTree(text);
+  if (trees.length === 0) {
+    if (_depth === 0) {
+      throw new Error('有効な Begin Object ... End Object ブロックが見つかりませんでした。');
+    }
+    return null;
   }
 
   // Pass 1: parse all node skeletons
   const allNodes = [];
-  for (const block of blocks) {
+  for (const tree of trees) {
+    const block = renderOuter(tree);
     const header = parseHeader(block);
     if (!header) continue;
     allNodes.push({
@@ -463,6 +541,7 @@ function compact(text, opts) {
       type: header.type,
       classPath: header.classPath,
       block,
+      tree,
       pins: parsePins(block),
       pos: { x: extractInt(block, 'NodePosX'), y: extractInt(block, 'NodePosY') },
       size: { w: extractInt(block, 'NodeWidth'), h: extractInt(block, 'NodeHeight') },
@@ -877,6 +956,22 @@ function compact(text, opts) {
         // Standalone comment with no contained nodes — keep as a node so info isn't lost.
         outNodes[c.id] = { k: 'Comment', text: c.comment };
       }
+    }
+  }
+
+  // Pass 5: recursively expand inline subgraphs (collapsed Composite nodes).
+  // UE embeds the full inner graph of K2Node_Composite in its clipboard text,
+  // so we run compact() again on the extracted subset and attach the result
+  // under `subgraph`. Depth-cap at 10 as a runaway guard.
+  if (_depth < 10) {
+    for (const n of allNodes) {
+      if (n.type !== 'Composite') continue;
+      const target = outNodes[n.id];
+      if (!target) continue;
+      const subText = extractSubgraphText(n.tree);
+      if (!subText) continue;
+      const sub = compact(subText, opts, _depth + 1);
+      if (sub) target.subgraph = sub;
     }
   }
 
